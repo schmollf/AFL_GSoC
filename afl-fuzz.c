@@ -2259,32 +2259,50 @@ EXP_ST void init_forkserver(char** argv) {
 /* Execute target application, monitoring for timeouts. Return status
    information. The called program will update trace_bits[]. */
 
-/* command to run AFL: sudo ./afl-fuzz -i ~/testcase_dir -o ~/findings_dir -r 35 /path/of/program */
+/* command to run AFL: sudo ./afl-fuzz -i /home/felix/testcase_dir -o /home/felix/findings_dir -r 35 /path/of/program */
+
+/** TODO:
+   * how to make AFL actually fuzz anything
+   * pass buffer from XTF to AFL
+   * (fix polling)
+   * (setup secondary console)
+   * submit patch for XTF reading
+   * dictionary for AFL
+   * run test case in XTF
+*/ 
 
 static u8 run_target(char** argv, u32 timeout) {
+  static int it = 0;
+  printf("Enter run_target\n");
 
-   static int it = 0;
+//  if(it > 10) { exit(0); } else { ++it; }
 
-   if(it > 4) { exit(0); } else { ++it; }
+  size_t buf_size = 100;
+  char buffer[buf_size];
 
-   //MARK: do stuff
-   size_t buf_size = 100;
-   char buffer[buf_size];
+  /* try to write to child and read something back */
+  dprintf(pipefd_to_xtf[1], "Hello from AFL\n");
 
-   printf("Enter run_target\n");
+  int num = read(pipefd_from_xtf[0], buffer, buf_size);
+  buffer[num] = '\0';
 
-   /* try to write to child and read something back */
-   dprintf(pipefd_to_xtf[1], "Hello from AFL\n");
-
-   int num = read(pipefd_from_xtf[0], buffer, buf_size);
-
-   if( num <= 0 ) {
+  if( num <= 0 ) {
      printf("Couldn't read from XTF\n");
-     return 0;
-   } else {
-     printf("Read from XTF: %s\n", buffer); 
-     return FAULT_NONE;
-   }
+     return FAULT_NOINST;
+  }
+  
+  printf("Read from XTF: >>>>> %s <<<<<\n", buffer); 
+
+  trace_bits[200] = it;
+
+#ifdef __x86_64__
+  classify_counts((u64*)trace_bits);
+#else
+  classify_counts((u32*)trace_bits);
+#endif /* ^__x86_64__ */
+
+  return FAULT_NONE;
+
 }
 
 
@@ -2358,6 +2376,7 @@ static void show_stats(void);
 static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
                          u32 handicap, u8 from_queue) {
 
+  printf("calibrating case");
   static u8 first_trace[MAP_SIZE];
 
   u8  fault = 0, new_bits = 0, var_detected = 0,
@@ -2408,6 +2427,7 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
     if (stop_soon || fault != crash_mode) goto abort_calibration;
 
     if (!dumb_mode && !stage_cur && !count_bytes(trace_bits)) {
+      printf("Counted bytes, fault noinst\n");
       fault = FAULT_NOINST;
       goto abort_calibration;
     }
@@ -2472,6 +2492,7 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
   if (!dumb_mode && first_run && !fault && !new_bits) fault = FAULT_NOBITS;
 
 abort_calibration:
+  printf("Aborted calibration");
 
   if (new_bits == 2 && !q->has_new_cov) {
     q->has_new_cov = 1;
@@ -4489,6 +4510,9 @@ static u32 choose_block_len(u32 limit) {
 
 static u32 calculate_score(struct queue_entry* q) {
 
+  //TODO: I assume that this is a bug caused by sth I did
+  //  if(!total_cal_cycles) return 0;
+
   u32 avg_exec_us = total_cal_us / total_cal_cycles;
   u32 avg_bitmap_size = total_bitmap_size / total_bitmap_entries;
   u32 perf_score = 100;
@@ -4830,6 +4854,8 @@ static u8 fuzz_one(char** argv) {
 
   if (queue_cur->cal_failed) {
 
+    printf("calibration failed earlier\n");
+
     u8 res = FAULT_TMOUT;
 
     if (queue_cur->cal_failed < CAL_CHANCES) {
@@ -4878,6 +4904,7 @@ static u8 fuzz_one(char** argv) {
    * PERFORMANCE SCORE *
    *********************/
 
+  printf("about to calculate score\n");
   orig_perf = perf_score = calculate_score(queue_cur);
 
   /* Skip right away if -d is given, if we have done deterministic fuzzing on
@@ -7497,10 +7524,9 @@ static void save_cmdline(u32 argc, char** argv) {
 
 }
 
-//MARK:
-/** 
+/**
   * @param domid Point to domid of XTF
-
+  *
   * TODO: error checking, always need sudo
   */
 static void setup_pipe_and_fork(char *domid) {
@@ -7508,10 +7534,10 @@ static void setup_pipe_and_fork(char *domid) {
   pid_t childpid;
   int ret;
 
-  if(ret = pipe(pipefd_to_xtf) < 0)
+  if( (ret = pipe(pipefd_to_xtf)) < 0)
     goto FAIL;
  
-  if(ret = pipe(pipefd_from_xtf) < 0)
+  if( (ret = pipe(pipefd_from_xtf)) < 0)
     goto FAIL;
 
   if((childpid = fork()) == -1) {
@@ -7521,41 +7547,36 @@ static void setup_pipe_and_fork(char *domid) {
 
   if (childpid == 0) { /* child */
 
-    /* close unneeded pipe ends */
+    /* close unnecessary pipe ends */
     close(pipefd_to_xtf[1]);
     close(pipefd_from_xtf[0]);
 
     /* stdin */
     close(0);
     if( (ret = dup(pipefd_to_xtf[0])) < 0 )
-        goto FAIL;
+      goto FAIL;
 
     /* stdout */
     close(1);
     if( (ret = dup(pipefd_from_xtf[1])) < 0 )
-        goto FAIL;
+      goto FAIL;
 
     char path[] = "/usr/local/sbin/xl";
     /* actually need to use second console */
     if( execl(path, path, "console", "-i", domid,  NULL) < 0 )
-        goto FAIL_FORK;
+      perror("execl");
 
   } else { /* parent */
 
-    /* close unneeded pipe ends */
+    /* close unnecessary pipe ends */
     close(pipefd_to_xtf[0]);
     close(pipefd_from_xtf[1]);
-
   }
 
   return;
 
   FAIL:
     printf("Failed to setup pipes, domain: %s, ret = %d\n", domain, ret);
-    exit(1);
-
-  FAIL_FORK:
-    printf("failed fork\n");
     exit(1);
 }
 
@@ -7844,7 +7865,9 @@ int main(int argc, char** argv) {
   else
     use_argv = argv + optind;
 
-//  perform_dry_run(use_argv);
+  setup_pipe_and_fork(domain);
+
+  perform_dry_run(use_argv);
 
   cull_queue();
 
@@ -7865,12 +7888,7 @@ int main(int argc, char** argv) {
     if (stop_soon) goto stop_fuzzing;
   }
 
-  //MARK:
-  setup_pipe_and_fork(domain);
-
-  //TODO: how often is this loop executed?!
   while (1) {
-
     u8 skipped_fuzz;
 
     cull_queue();
