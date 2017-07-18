@@ -56,6 +56,8 @@
 #include <sys/ioctl.h>
 #include <sys/file.h>
 
+#include <xenctrl.h>
+
 #if defined(__APPLE__) || defined(__FreeBSD__) || defined (__OpenBSD__)
 #  include <sys/sysctl.h>
 #endif /* __APPLE__ || __FreeBSD__ || __OpenBSD__ */
@@ -2272,28 +2274,28 @@ EXP_ST void init_forkserver(char** argv) {
 */ 
 
 static u8 run_target(char** argv, u32 timeout) {
-  static int it = 0;
-  printf("Enter run_target\n");
-
-//  if(it > 10) { exit(0); } else { ++it; }
 
   size_t buf_size = 100;
   char buffer[buf_size];
 
-  /* try to write to child and read something back */
+  /* write test case to XTF */
   dprintf(pipefd_to_xtf[1], "Hello from AFL\n");
+
+  xc_interface *xch = xc_interface_open(NULL, NULL, 0);
+  xc_edge_trace(xch, atoi(domain), 0, MAP_SIZE/8, (uint64_t*) trace_bits);
 
   int num = read(pipefd_from_xtf[0], buffer, buf_size);
   buffer[num] = '\0';
 
   if( num <= 0 ) {
      printf("Couldn't read from XTF\n");
+     xc_interface_close(xch);
      return FAULT_NOINST;
   }
   
-  printf("Read from XTF: >>>>> %s <<<<<\n", buffer); 
-
-  trace_bits[200] = it;
+  xc_edge_trace(xch, atoi(domain), 1, MAP_SIZE/8, (uint64_t*) trace_bits);
+  xc_interface_close(xch);
+  //printf("Read from XTF: >>>>> %s <<<<<\n", buffer);
 
 #ifdef __x86_64__
   classify_counts((u64*)trace_bits);
@@ -2302,7 +2304,6 @@ static u8 run_target(char** argv, u32 timeout) {
 #endif /* ^__x86_64__ */
 
   return FAULT_NONE;
-
 }
 
 
@@ -7529,7 +7530,7 @@ static void save_cmdline(u32 argc, char** argv) {
   *
   * TODO: error checking, always need sudo
   */
-static void setup_pipe_and_fork(char *domid) {
+static void setup_pipe_and_fork(char *domid_s) {
 
   pid_t childpid;
   int ret;
@@ -7561,9 +7562,14 @@ static void setup_pipe_and_fork(char *domid) {
     if( (ret = dup(pipefd_from_xtf[1])) < 0 )
       goto FAIL;
 
-    char path[] = "/usr/local/sbin/xl";
+    //char path[] = "/usr/local/sbin/xl";
     /* actually need to use second console */
-    if( execl(path, path, "console", "-i", domid,  NULL) < 0 )
+    //if( execl(path, path, "console", "-i", domid_s,  NULL) < 0 )
+    //  perror("execl");
+
+    char path[] = "/usr/local/lib/xen/bin/xenconsole";
+    if( execl(path, path, domid_s, "--num", "0", "--type", "pv",
+           "--pipe", (void *)NULL) < 0 )
       perror("execl");
 
   } else { /* parent */
