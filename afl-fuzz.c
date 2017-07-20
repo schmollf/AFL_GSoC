@@ -84,6 +84,8 @@
 int pipefd_to_xtf[2];
 int pipefd_from_xtf[2];
 char* domain;
+#define SIZE_MEM_WRITE_TO_TESTCASE 200
+int mem_write_to_testcase[SIZE_MEM_WRITE_TO_TESTCASE];
 
 EXP_ST u8 *in_dir,                    /* Input directory with test cases  */
           *out_file,                  /* File to fuzz, if any             */
@@ -2257,32 +2259,49 @@ EXP_ST void init_forkserver(char** argv) {
 
 }
 
+/** Process program counters into format expected by AFL and
+    insert into trace_bits.
+
+    cur_location = <COMPILE_TIME_RANDOM>;
+    shared_mem[cur_location ^ prev_location]++;
+    prev_location = cur_location >> 1;
+
+    TODO: use hash map
+*/
+void process_program_counters(uint64_t* pc_buffer, long pc_num) {
+
+  u32 cur_location = 0, prev_location = 0;
+
+  for(int i = 0; i < pc_num; ++i) {
+     cur_location = pc_buffer[i];
+     ++trace_bits[(cur_location ^ prev_location) % MAP_SIZE];
+     prev_location = cur_location >> 1;
+//     printf("i: %d, cur_location %d, pc %ld\n", i, cur_location, pc_buffer[i]);
+  }
+}
 
 /* Execute target application, monitoring for timeouts. Return status
    information. The called program will update trace_bits[]. */
 
-/* command to run AFL: sudo ./afl-fuzz -i /home/felix/testcase_dir -o /home/felix/findings_dir -r 35 /path/of/program */
-
-/** TODO:
-   * how to make AFL actually fuzz anything
-   * pass buffer from XTF to AFL
-   * (fix polling)
-   * (setup secondary console)
-   * submit patch for XTF reading
-   * dictionary for AFL
-   * run test case in XTF
-*/ 
+/* command to run AFL: sudo ./afl-fuzz -i /home/felix/testcase_dir -o /home/felix/findings_dir -r 35 / */
 
 static u8 run_target(char** argv, u32 timeout) {
+
+  //memset(trace_bits, 0, MAP_SIZE);
+//  printf("argv[0]: %s argv[1]: %s\n", argv[0], argv[1]);
 
   size_t buf_size = 100;
   char buffer[buf_size];
 
+  int pc_buffer_size = 100000;
+  uint64_t pc_buffer[pc_buffer_size];
+
   /* write test case to XTF */
-  dprintf(pipefd_to_xtf[1], "Hello from AFL\n");
+//  dprintf(pipefd_to_xtf[1], "Hello from AFL\n");
+  write(pipefd_to_xtf[1], mem_write_to_testcase, 70);
 
   xc_interface *xch = xc_interface_open(NULL, NULL, 0);
-  xc_edge_trace(xch, atoi(domain), 0, MAP_SIZE/8, (uint64_t*) trace_bits);
+  xc_edge_trace(xch, atoi(domain), 0, pc_buffer_size, pc_buffer);
 
   int num = read(pipefd_from_xtf[0], buffer, buf_size);
   buffer[num] = '\0';
@@ -2293,9 +2312,13 @@ static u8 run_target(char** argv, u32 timeout) {
      return FAULT_NOINST;
   }
   
-  xc_edge_trace(xch, atoi(domain), 1, MAP_SIZE/8, (uint64_t*) trace_bits);
+  long pc_num = xc_edge_trace(xch, atoi(domain), 1, pc_buffer_size, pc_buffer);
   xc_interface_close(xch);
-  //printf("Read from XTF: >>>>> %s <<<<<\n", buffer);
+  printf("Read from XTF: >>>>> %s <<<<<\n", buffer);
+
+  //printf("pc_num: %ld\n", pc_num);
+
+  process_program_counters(pc_buffer, pc_num);
 
 #ifdef __x86_64__
   classify_counts((u64*)trace_bits);
@@ -2312,6 +2335,10 @@ static u8 run_target(char** argv, u32 timeout) {
    truncated. */
 
 static void write_to_testcase(void* mem, u32 len) {
+
+//  printf("writing to testcase: %s\n", out_file);
+
+  memcpy(mem_write_to_testcase, mem, (len < SIZE_MEM_WRITE_TO_TESTCASE)?len:SIZE_MEM_WRITE_TO_TESTCASE);
 
   s32 fd = out_fd;
 
@@ -7569,7 +7596,7 @@ static void setup_pipe_and_fork(char *domid_s) {
 
     char path[] = "/usr/local/lib/xen/bin/xenconsole";
     if( execl(path, path, domid_s, "--num", "0", "--type", "pv",
-           "--pipe", (void *)NULL) < 0 )
+           "--interactive", (void *)NULL) < 0 )
       perror("execl");
 
   } else { /* parent */
