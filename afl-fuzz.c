@@ -2287,7 +2287,7 @@ void process_program_counters(uint64_t* pc_buffer, long pc_num) {
 
 static u8 run_target(char** argv, u32 timeout) {
 
-  //memset(trace_bits, 0, MAP_SIZE);
+  memset(trace_bits, 0, MAP_SIZE);
 //  printf("argv[0]: %s argv[1]: %s\n", argv[0], argv[1]);
 
   size_t buf_size = 100;
@@ -2297,11 +2297,12 @@ static u8 run_target(char** argv, u32 timeout) {
   uint64_t pc_buffer[pc_buffer_size];
 
   /* write test case to XTF */
-//  dprintf(pipefd_to_xtf[1], "Hello from AFL\n");
-  write(pipefd_to_xtf[1], mem_write_to_testcase, 70);
+  //  dprintf(pipefd_to_xtf[1], "Hello from AFL\n");
 
   xc_interface *xch = xc_interface_open(NULL, NULL, 0);
   xc_edge_trace(xch, atoi(domain), 0, pc_buffer_size, pc_buffer);
+  
+  (void) write(pipefd_to_xtf[1], mem_write_to_testcase, 70);
 
   int num = read(pipefd_from_xtf[0], buffer, buf_size);
   buffer[num] = '\0';
@@ -2315,7 +2316,6 @@ static u8 run_target(char** argv, u32 timeout) {
   long pc_num = xc_edge_trace(xch, atoi(domain), 1, pc_buffer_size, pc_buffer);
   xc_interface_close(xch);
   printf("Read from XTF: >>>>> %s <<<<<\n", buffer);
-
   //printf("pc_num: %ld\n", pc_num);
 
   process_program_counters(pc_buffer, pc_num);
@@ -2339,6 +2339,11 @@ static void write_to_testcase(void* mem, u32 len) {
 //  printf("writing to testcase: %s\n", out_file);
 
   memcpy(mem_write_to_testcase, mem, (len < SIZE_MEM_WRITE_TO_TESTCASE)?len:SIZE_MEM_WRITE_TO_TESTCASE);
+
+  s32 my_file = open("/home/felix/testcase", O_WRONLY | O_CREAT | O_EXCL, 0600);
+  ck_write(my_file, mem, len, "/home/felix/testcase");
+  fsync(my_file);
+  close(my_file);
 
   s32 fd = out_fd;
 
@@ -2404,7 +2409,7 @@ static void show_stats(void);
 static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
                          u32 handicap, u8 from_queue) {
 
-  printf("calibrating case");
+  printf("calibrating case\n");
   static u8 first_trace[MAP_SIZE];
 
   u8  fault = 0, new_bits = 0, var_detected = 0,
