@@ -81,11 +81,17 @@
 /* Lots of globals, but mostly for the status UI and other things where it
    really makes no sense to haul them around as function parameters. */
 
+#define SIZE_MEM_WRITE_TO_TESTCASE 80
+#define TEST_CASE_LOG_PATH "/home/felix/testcase"
+#define OVERALL_LOG_PATH "/home/felix/afl.log"
+
 int pipefd_to_xtf[2];
 int pipefd_from_xtf[2];
 char* domain;
-#define SIZE_MEM_WRITE_TO_TESTCASE 200
+
 int mem_write_to_testcase[SIZE_MEM_WRITE_TO_TESTCASE];
+
+FILE* log_file;
 
 EXP_ST u8 *in_dir,                    /* Input directory with test cases  */
           *out_file,                  /* File to fuzz, if any             */
@@ -2276,7 +2282,6 @@ void process_program_counters(uint64_t* pc_buffer, long pc_num) {
      cur_location = pc_buffer[i];
      ++trace_bits[(cur_location ^ prev_location) % MAP_SIZE];
      prev_location = cur_location >> 1;
-//     printf("i: %d, cur_location %d, pc %ld\n", i, cur_location, pc_buffer[i]);
   }
 }
 
@@ -2287,6 +2292,21 @@ void process_program_counters(uint64_t* pc_buffer, long pc_num) {
 
 static u8 run_target(char** argv, u32 timeout) {
 
+  long arg1, arg2, arg3, arg4;
+  unsigned long hypercall_num = ((*(long*) mem_write_to_testcase) % 41);
+  arg1 = *(((long*) mem_write_to_testcase) + 1);
+  arg2 = *(((long*) mem_write_to_testcase) + 2);
+  arg3 = *(((long*) mem_write_to_testcase) + 3);
+  arg4 = *(((long*) mem_write_to_testcase) + 4);
+
+  int int_ret;
+  if( (int_ret = fprintf(log_file, "get_cur_time %ld %li %li %ld %ld %ld\n", get_cur_time(), hypercall_num, arg1, arg2, arg3, arg4)) < 0) {
+    printf("Couldn't write to file\n");
+    exit(1);
+  }
+  
+  fflush(log_file);
+
   memset(trace_bits, 0, MAP_SIZE);
 //  printf("argv[0]: %s argv[1]: %s\n", argv[0], argv[1]);
 
@@ -2295,28 +2315,48 @@ static u8 run_target(char** argv, u32 timeout) {
 
   int pc_buffer_size = 100000;
   uint64_t pc_buffer[pc_buffer_size];
+  int num;
+  long ret;
 
   /* write test case to XTF */
-  //  dprintf(pipefd_to_xtf[1], "Hello from AFL\n");
 
   xc_interface *xch = xc_interface_open(NULL, NULL, 0);
-  xc_edge_trace(xch, atoi(domain), 0, pc_buffer_size, pc_buffer);
-  
-  (void) write(pipefd_to_xtf[1], mem_write_to_testcase, 70);
 
-  int num = read(pipefd_from_xtf[0], buffer, buf_size);
+  if(xch == NULL) {
+    fclose(log_file);
+    printf("Couldn't open xen interface\n");
+    exit(1);
+  }
+  
+  ret = xc_trace_pc(xch, atoi(domain), 0, pc_buffer_size, pc_buffer);
+
+  if(ret < 0) {
+    fclose(log_file);
+    printf("Start edge_trace failed: %ld\n", ret);
+    xc_interface_close(xch);
+    exit(1);
+  }
+   
+  (void) write(pipefd_to_xtf[1], mem_write_to_testcase, SIZE_MEM_WRITE_TO_TESTCASE);
+
+  num = read(pipefd_from_xtf[0], buffer, buf_size);
+  num = read(pipefd_from_xtf[0], buffer, buf_size);
   buffer[num] = '\0';
 
   if( num <= 0 ) {
+     fclose(log_file);
      printf("Couldn't read from XTF\n");
      xc_interface_close(xch);
-     return FAULT_NOINST;
+     exit(1);
   }
   
-  long pc_num = xc_edge_trace(xch, atoi(domain), 1, pc_buffer_size, pc_buffer);
+  long pc_num = xc_trace_pc(xch, atoi(domain), 1, pc_buffer_size, pc_buffer);
   xc_interface_close(xch);
-  printf("Read from XTF: >>>>> %s <<<<<\n", buffer);
-  //printf("pc_num: %ld\n", pc_num);
+
+  if( pc_num < 0 ) {
+     printf("Stop edge_trace failed: %ld\n", ret);
+     exit(1);
+  }
 
   process_program_counters(pc_buffer, pc_num);
 
@@ -2336,12 +2376,12 @@ static u8 run_target(char** argv, u32 timeout) {
 
 static void write_to_testcase(void* mem, u32 len) {
 
-//  printf("writing to testcase: %s\n", out_file);
-
+  memset(mem_write_to_testcase, 0, SIZE_MEM_WRITE_TO_TESTCASE);
   memcpy(mem_write_to_testcase, mem, (len < SIZE_MEM_WRITE_TO_TESTCASE)?len:SIZE_MEM_WRITE_TO_TESTCASE);
 
-  s32 my_file = open("/home/felix/testcase", O_WRONLY | O_CREAT | O_EXCL, 0600);
-  ck_write(my_file, mem, len, "/home/felix/testcase");
+  remove(TEST_CASE_LOG_PATH);
+  s32 my_file = open(TEST_CASE_LOG_PATH, O_WRONLY | O_CREAT | O_EXCL , 0600);
+  ck_write(my_file, mem, SIZE_MEM_WRITE_TO_TESTCASE, TEST_CASE_LOG_PATH);
   fsync(my_file);
   close(my_file);
 
@@ -2372,6 +2412,15 @@ static void write_to_testcase(void* mem, u32 len) {
 /* The same, but with an adjustable gap. Used for trimming. */
 
 static void write_with_gap(void* mem, u32 len, u32 skip_at, u32 skip_len) {
+
+  memset(mem_write_to_testcase, 0, SIZE_MEM_WRITE_TO_TESTCASE);
+  memcpy(mem_write_to_testcase, mem, (len < SIZE_MEM_WRITE_TO_TESTCASE)?len:SIZE_MEM_WRITE_TO_TESTCASE);
+
+  remove(TEST_CASE_LOG_PATH);
+  s32 my_file = open(TEST_CASE_LOG_PATH, O_WRONLY | O_CREAT | O_EXCL , 0600);
+  ck_write(my_file, mem, SIZE_MEM_WRITE_TO_TESTCASE, TEST_CASE_LOG_PATH);
+  fsync(my_file);
+  close(my_file);
 
   s32 fd = out_fd;
   u32 tail_len = len - skip_at - skip_len;
@@ -2409,7 +2458,7 @@ static void show_stats(void);
 static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
                          u32 handicap, u8 from_queue) {
 
-  printf("calibrating case\n");
+  //printf("calibrating case\n");
   static u8 first_trace[MAP_SIZE];
 
   u8  fault = 0, new_bits = 0, var_detected = 0,
@@ -2460,7 +2509,7 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
     if (stop_soon || fault != crash_mode) goto abort_calibration;
 
     if (!dumb_mode && !stage_cur && !count_bytes(trace_bits)) {
-      printf("Counted bytes, fault noinst\n");
+      //printf("Counted bytes, fault noinst\n");
       fault = FAULT_NOINST;
       goto abort_calibration;
     }
@@ -2525,7 +2574,7 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
   if (!dumb_mode && first_run && !fault && !new_bits) fault = FAULT_NOBITS;
 
 abort_calibration:
-  printf("Aborted calibration");
+//  printf("Aborted calibration");
 
   if (new_bits == 2 && !q->has_new_cov) {
     q->has_new_cov = 1;
@@ -4364,6 +4413,7 @@ static u8 trim_case(char** argv, struct queue_entry* q, u8* in_buf) {
       u32 cksum;
 
       write_with_gap(in_buf, q->len, remove_pos, trim_avail);
+      //TODO: I am not submitting the right test case here
 
       fault = run_target(argv, exec_tmout);
       trim_execs++;
@@ -4937,7 +4987,6 @@ static u8 fuzz_one(char** argv) {
    * PERFORMANCE SCORE *
    *********************/
 
-  printf("about to calculate score\n");
   orig_perf = perf_score = calculate_score(queue_cur);
 
   /* Skip right away if -d is given, if we have done deterministic fuzzing on
@@ -7563,6 +7612,8 @@ static void save_cmdline(u32 argc, char** argv) {
   * TODO: error checking, always need sudo
   */
 static void setup_pipe_and_fork(char *domid_s) {
+
+  log_file = fopen(OVERALL_LOG_PATH, "w");
 
   pid_t childpid;
   int ret;
