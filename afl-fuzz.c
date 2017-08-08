@@ -57,6 +57,7 @@
 #include <sys/file.h>
 
 #include <xenctrl.h>
+#include "hash_map.h"
 
 #if defined(__APPLE__) || defined(__FreeBSD__) || defined (__OpenBSD__)
 #  include <sys/sysctl.h>
@@ -81,6 +82,7 @@
 /* Lots of globals, but mostly for the status UI and other things where it
    really makes no sense to haul them around as function parameters. */
 
+#define NUM_BUCKETS 1000 
 #define SIZE_MEM_WRITE_TO_TESTCASE 80
 #define TEST_CASE_LOG_PATH "/home/felix/testcase"
 #define OVERALL_LOG_PATH "/home/felix/afl.log"
@@ -88,6 +90,7 @@
 int pipefd_to_xtf[2];
 int pipefd_from_xtf[2];
 char* domain;
+hash_map* map;
 
 int mem_write_to_testcase[SIZE_MEM_WRITE_TO_TESTCASE];
 
@@ -2265,6 +2268,7 @@ EXP_ST void init_forkserver(char** argv) {
 
 }
 
+
 /** Process program counters into format expected by AFL and
     insert into trace_bits.
 
@@ -2277,12 +2281,25 @@ EXP_ST void init_forkserver(char** argv) {
 void process_program_counters(uint64_t* pc_buffer, long pc_num) {
 
   u32 cur_location = 0, prev_location = 0;
+  hash_bucket* bucket;
 
   for(int i = 0; i < pc_num; ++i) {
-     cur_location = pc_buffer[i];
-     ++trace_bits[(cur_location ^ prev_location) % MAP_SIZE];
-     prev_location = cur_location >> 1;
+    bucket = _hash_map_lookup(map, pc_buffer[i]);
+    if( !bucket ) {
+       cur_location = UR(MAP_SIZE);
+       if(!_hash_map_insert(map, pc_buffer[i], cur_location)) {
+         printf("Couldn't insert into hash map\n");
+         exit(1);
+       }
+    } else {
+      cur_location = bucket->val;
+    }
+
+    trace_bits[(cur_location ^ prev_location) % MAP_SIZE]++;
+    prev_location = cur_location >> 1;
   }
+
+
 }
 
 /* Execute target application, monitoring for timeouts. Return status
@@ -2339,7 +2356,6 @@ static u8 run_target(char** argv, u32 timeout) {
    
   (void) write(pipefd_to_xtf[1], mem_write_to_testcase, SIZE_MEM_WRITE_TO_TESTCASE);
 
-  num = read(pipefd_from_xtf[0], buffer, buf_size);
   num = read(pipefd_from_xtf[0], buffer, buf_size);
   buffer[num] = '\0';
 
@@ -7612,6 +7628,12 @@ static void save_cmdline(u32 argc, char** argv) {
   * TODO: error checking, always need sudo
   */
 static void setup_pipe_and_fork(char *domid_s) {
+  map = _hash_map_create(NUM_BUCKETS);
+
+  if(!map) {
+    printf("Hash map could not be created");
+    exit(1);
+  }
 
   log_file = fopen(OVERALL_LOG_PATH, "w");
 
