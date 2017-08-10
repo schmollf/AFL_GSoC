@@ -86,6 +86,7 @@
 #define SIZE_MEM_WRITE_TO_TESTCASE 80
 #define TEST_CASE_LOG_PATH "/home/felix/testcase"
 #define OVERALL_LOG_PATH "/home/felix/afl.log"
+#define XENCONSOLE_PATH "/usr/local/lib/xen/bin/xenconsole"
 
 int pipefd_to_xtf[2];
 int pipefd_from_xtf[2];
@@ -2299,26 +2300,23 @@ void process_program_counters(uint64_t* pc_buffer, long pc_num) {
 
 }
 
-/* Execute target application, monitoring for timeouts. Return status
-   information. The called program will update trace_bits[]. */
-
-/* command to run AFL: sudo ./afl-fuzz -i /home/felix/testcase_dir -o /home/felix/findings_dir -r DOM_ID /not/used/path; Also need to set AFL_NO_FORKSRV=1 env variable*/
+/* Send test case to XTF-server. */
 
 static u8 run_target(char** argv, u32 timeout) {
 
-  long arg1, arg2, arg3, arg4;
-  unsigned long hypercall_num = ((*(long*) mem_write_to_testcase) % 41);
+  long hypercall_num, arg1, arg2, arg3, arg4;
+  hypercall_num = ((*(long*) mem_write_to_testcase) % 41);
   arg1 = *(((long*) mem_write_to_testcase) + 1);
   arg2 = *(((long*) mem_write_to_testcase) + 2);
   arg3 = *(((long*) mem_write_to_testcase) + 3);
   arg4 = *(((long*) mem_write_to_testcase) + 4);
 
   int int_ret;
-  if( (int_ret = fprintf(log_file, "get_cur_time %ld %li %li %ld %ld %ld\n", get_cur_time(), hypercall_num, arg1, arg2, arg3, arg4)) < 0)
+  if( (int_ret = fprintf(log_file, "get_cur_time %ld %li %li %ld %ld %ld\n",
+                         get_cur_time(), hypercall_num, arg1, arg2, arg3, arg4)) < 0 )
     FATAL("run_target: Couldn't write to file\n");
 
   fflush(log_file);
-
   memset(trace_bits, 0, MAP_SIZE);
 
   size_t buf_size = 100;
@@ -2333,20 +2331,26 @@ static u8 run_target(char** argv, u32 timeout) {
 
   xc_interface *xch = xc_interface_open(NULL, NULL, 0);
 
-  if(xch == NULL) {
+  if( xch == NULL ) {
     fclose(log_file);
     FATAL("run_target: Couldn't open xen interface\n");
   }
   
   ret = xc_trace_pc(xch, atoi(domain), 0, pc_buffer_size, pc_buffer);
 
-  if(ret < 0) {
+  if( ret < 0 ) {
     fclose(log_file);
     xc_interface_close(xch);
     FATAL("run_target: Start edge_trace failed\n");
   }
 
-  (void) write(pipefd_to_xtf[1], mem_write_to_testcase, SIZE_MEM_WRITE_TO_TESTCASE);
+  num = write(pipefd_to_xtf[1], mem_write_to_testcase, SIZE_MEM_WRITE_TO_TESTCASE);
+
+  if( num <= 0 ) {
+     fclose(log_file);
+     xc_interface_close(xch);
+     FATAL("run_target: Couldn't write to XTF\n");
+  }
 
   num = read(pipefd_from_xtf[0], buffer, buf_size);
   buffer[num] = '\0';
@@ -2355,15 +2359,14 @@ static u8 run_target(char** argv, u32 timeout) {
      fclose(log_file);
      xc_interface_close(xch);
      FATAL("run_target: Couldn't read from XTF\n");
-     exit(1);
   }
 
   long pc_num = xc_trace_pc(xch, atoi(domain), 1, pc_buffer_size, pc_buffer);
   xc_interface_close(xch);
 
   if( pc_num < 0 ) {
-     printf("Stop edge_trace failed: %ld\n", ret);
-     exit(1);
+     fclose(log_file);
+     FATAL("run_target: Stop edge_trace failed\n");
   }
 
   process_program_counters(pc_buffer, pc_num);
@@ -7612,7 +7615,7 @@ static void save_cmdline(u32 argc, char** argv) {
   * sets up pipes such that stdout and stdin can be used to communicate
   * with the XTF-server.
   *
-  * TODO: error checking, always need sudo
+  * TODO      make this two separate functions
   */
 static void setup_pipe_and_fork(char *domid_s) {
   map = _hash_map_create(NUM_BUCKETS);
@@ -7622,6 +7625,9 @@ static void setup_pipe_and_fork(char *domid_s) {
   }
 
   log_file = fopen(OVERALL_LOG_PATH, "w");
+
+  if(log_file < 0)
+    goto FAIL;
 
   pid_t childpid;
   int ret;
@@ -7651,10 +7657,8 @@ static void setup_pipe_and_fork(char *domid_s) {
     if( (ret = dup(pipefd_from_xtf[1])) < 0 )
       goto FAIL;
 
-    /* actually need to use second console */
-    char path[] = "/usr/local/lib/xen/bin/xenconsole";
-    if( execl(path, path, domid_s, "--num", "0", "--type", "pv",
-              "--interactive", (void *)NULL) < 0 )
+    if( execl(XENCONSOLE_PATH, XENCONSOLE_PATH, domid_s, "--num", "0",
+              "--type", "pv", "--interactive", (void *)NULL) < 0 )
       FATAL("setup_pipe_and_fork: execl");
 
   } else { /* parent */
