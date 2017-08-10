@@ -2275,8 +2275,6 @@ EXP_ST void init_forkserver(char** argv) {
     cur_location = <COMPILE_TIME_RANDOM>;
     shared_mem[cur_location ^ prev_location]++;
     prev_location = cur_location >> 1;
-
-    TODO: use hash map
 */
 void process_program_counters(uint64_t* pc_buffer, long pc_num) {
 
