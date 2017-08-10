@@ -93,7 +93,7 @@ int pipefd_from_xtf[2];
 char* domain;
 hash_map* map;
 
-int mem_write_to_testcase[SIZE_MEM_WRITE_TO_TESTCASE];
+long mem_write_to_testcase[SIZE_MEM_WRITE_TO_TESTCASE];
 
 FILE* log_file;
 
@@ -2297,79 +2297,68 @@ void process_program_counters(uint64_t* pc_buffer, long pc_num) {
     prev_location = cur_location >> 1;
   }
 
-
 }
 
 /* Send test case to XTF-server. */
 
-static u8 run_target(char** argv, u32 timeout) {
-
-  long hypercall_num, arg1, arg2, arg3, arg4;
-  hypercall_num = ((*(long*) mem_write_to_testcase) % 41);
-  arg1 = *(((long*) mem_write_to_testcase) + 1);
-  arg2 = *(((long*) mem_write_to_testcase) + 2);
-  arg3 = *(((long*) mem_write_to_testcase) + 3);
-  arg4 = *(((long*) mem_write_to_testcase) + 4);
-
-  int int_ret;
-  if( (int_ret = fprintf(log_file, "get_cur_time %ld %li %li %ld %ld %ld\n",
-                         get_cur_time(), hypercall_num, arg1, arg2, arg3, arg4)) < 0 )
-    FATAL("run_target: Couldn't write to file\n");
-
-  fflush(log_file);
-  memset(trace_bits, 0, MAP_SIZE);
+static u8 send_test_to_xtf(char** argv, u32 timeout) {
 
   size_t buf_size = 100;
   char buffer[buf_size];
 
   int pc_buffer_size = 100000;
   uint64_t pc_buffer[pc_buffer_size];
-  int num;
   long ret;
 
-  /* write test case to XTF */
+  /* log the test case that is about to be send */
+  if( fprintf(log_file, "get_cur_time %ld %li %li %ld %ld %ld\n",
+                         (long) get_cur_time(),
+                         mem_write_to_testcase[0] % 41,
+                         mem_write_to_testcase[1],
+                         mem_write_to_testcase[2],
+                         mem_write_to_testcase[3],
+                         mem_write_to_testcase[4]) < 0 )
+    FATAL("send_test_to_xtf: Couldn't write to file\n");
+
+  fflush(log_file);
+  memset(trace_bits, 0, MAP_SIZE);
 
   xc_interface *xch = xc_interface_open(NULL, NULL, 0);
-
   if( xch == NULL ) {
     fclose(log_file);
-    FATAL("run_target: Couldn't open xen interface\n");
+    FATAL("send_test_to_xtf: Couldn't open xen interface\n");
   }
-  
-  ret = xc_trace_pc(xch, atoi(domain), 0, pc_buffer_size, pc_buffer);
 
-  if( ret < 0 ) {
+  if( xc_trace_pc(xch, atoi(domain), 0, pc_buffer_size, pc_buffer) < 0 ) {
     fclose(log_file);
     xc_interface_close(xch);
-    FATAL("run_target: Start edge_trace failed\n");
+    FATAL("send_test_to_xtf: Start edge_trace failed\n");
   }
 
-  num = write(pipefd_to_xtf[1], mem_write_to_testcase, SIZE_MEM_WRITE_TO_TESTCASE);
-
-  if( num <= 0 ) {
+  /* send tet case to XTF */
+  if( write(pipefd_to_xtf[1], (char*) mem_write_to_testcase,
+              SIZE_MEM_WRITE_TO_TESTCASE) <= 0 ) {
      fclose(log_file);
      xc_interface_close(xch);
-     FATAL("run_target: Couldn't write to XTF\n");
+     FATAL("send_test_to_xtf: Couldn't write to XTF\n");
   }
 
-  num = read(pipefd_from_xtf[0], buffer, buf_size);
-  buffer[num] = '\0';
-
-  if( num <= 0 ) {
+  /* XTF will message us when it's hypercall returned */
+  if( read(pipefd_from_xtf[0], buffer, buf_size) < 0 ) {
      fclose(log_file);
      xc_interface_close(xch);
-     FATAL("run_target: Couldn't read from XTF\n");
+     FATAL("send_test_to_xtf: Couldn't read from XTF\n");
   }
 
-  long pc_num = xc_trace_pc(xch, atoi(domain), 1, pc_buffer_size, pc_buffer);
+  ret = xc_trace_pc(xch, atoi(domain), 1, pc_buffer_size, pc_buffer);
   xc_interface_close(xch);
 
-  if( pc_num < 0 ) {
+  if( ret < 0 ) {
      fclose(log_file);
-     FATAL("run_target: Stop edge_trace failed\n");
+     FATAL("send_test_to_xtf: Stop edge_trace failed\n");
   }
 
-  process_program_counters(pc_buffer, pc_num);
+  process_program_counters(pc_buffer, ret);
 
 #ifdef __x86_64__
   classify_counts((u64*)trace_bits);
@@ -2381,14 +2370,216 @@ static u8 run_target(char** argv, u32 timeout) {
 }
 
 
+/* Execute target application, monitoring for timeouts. Return status
+   information. The called program will update trace_bits[]. */
+
+static u8 run_target(char** argv, u32 timeout) {
+
+  static struct itimerval it;
+  static u32 prev_timed_out = 0;
+
+  int status = 0;
+  u32 tb4;
+
+  child_timed_out = 0;
+
+  /* After this memset, trace_bits[] are effectively volatile, so we
+     must prevent any earlier operations from venturing into that
+     territory. */
+
+  memset(trace_bits, 0, MAP_SIZE);
+  MEM_BARRIER();
+
+  /* If we're running in "dumb" mode, we can't rely on the fork server
+     logic compiled into the target program, so we will just keep calling
+     execve(). There is a bit of code duplication between here and 
+     init_forkserver(), but c'est la vie. */
+
+  if (dumb_mode == 1 || no_forkserver) {
+
+    child_pid = fork();
+
+    if (child_pid < 0) PFATAL("fork() failed");
+
+    if (!child_pid) {
+
+      struct rlimit r;
+
+      if (mem_limit) {
+
+        r.rlim_max = r.rlim_cur = ((rlim_t)mem_limit) << 20;
+
+#ifdef RLIMIT_AS
+
+        setrlimit(RLIMIT_AS, &r); /* Ignore errors */
+
+#else
+
+        setrlimit(RLIMIT_DATA, &r); /* Ignore errors */
+
+#endif /* ^RLIMIT_AS */
+
+      }
+
+      r.rlim_max = r.rlim_cur = 0;
+
+      setrlimit(RLIMIT_CORE, &r); /* Ignore errors */
+
+      /* Isolate the process and configure standard descriptors. If out_file is
+         specified, stdin is /dev/null; otherwise, out_fd is cloned instead. */
+
+      setsid();
+
+      dup2(dev_null_fd, 1);
+      dup2(dev_null_fd, 2);
+
+      if (out_file) {
+
+        dup2(dev_null_fd, 0);
+
+      } else {
+
+        dup2(out_fd, 0);
+        close(out_fd);
+
+      }
+
+      /* On Linux, would be faster to use O_CLOEXEC. Maybe TODO. */
+
+      close(dev_null_fd);
+      close(out_dir_fd);
+      close(dev_urandom_fd);
+      close(fileno(plot_file));
+
+      /* Set sane defaults for ASAN if nothing else specified. */
+
+      setenv("ASAN_OPTIONS", "abort_on_error=1:"
+                             "detect_leaks=0:"
+                             "symbolize=0:"
+                             "allocator_may_return_null=1", 0);
+
+      setenv("MSAN_OPTIONS", "exit_code=" STRINGIFY(MSAN_ERROR) ":"
+                             "symbolize=0:"
+                             "msan_track_origins=0", 0);
+
+      execv(target_path, argv);
+
+      /* Use a distinctive bitmap value to tell the parent about execv()
+         falling through. */
+
+      *(u32*)trace_bits = EXEC_FAIL_SIG;
+      exit(0);
+
+    }
+
+  } else {
+
+    s32 res;
+
+    /* In non-dumb mode, we have the fork server up and running, so simply
+       tell it to have at it, and then read back PID. */
+
+    if ((res = write(fsrv_ctl_fd, &prev_timed_out, 4)) != 4) {
+
+      if (stop_soon) return 0;
+      RPFATAL(res, "Unable to request new process from fork server (OOM?)");
+
+    }
+
+    if ((res = read(fsrv_st_fd, &child_pid, 4)) != 4) {
+
+      if (stop_soon) return 0;
+      RPFATAL(res, "Unable to request new process from fork server (OOM?)");
+
+    }
+
+    if (child_pid <= 0) FATAL("Fork server is misbehaving (OOM?)");
+
+  }
+
+  /* Configure timeout, as requested by user, then wait for child to terminate. */
+
+  it.it_value.tv_sec = (timeout / 1000);
+  it.it_value.tv_usec = (timeout % 1000) * 1000;
+
+  setitimer(ITIMER_REAL, &it, NULL);
+
+  /* The SIGALRM handler simply kills the child_pid and sets child_timed_out. */
+
+  if (dumb_mode == 1 || no_forkserver) {
+
+    if (waitpid(child_pid, &status, 0) <= 0) PFATAL("waitpid() failed");
+
+  } else {
+
+    s32 res;
+
+    if ((res = read(fsrv_st_fd, &status, 4)) != 4) {
+
+      if (stop_soon) return 0;
+      RPFATAL(res, "Unable to communicate with fork server (OOM?)");
+
+    }
+
+  }
+
+  if (!WIFSTOPPED(status)) child_pid = 0;
+
+  it.it_value.tv_sec = 0;
+  it.it_value.tv_usec = 0;
+
+  setitimer(ITIMER_REAL, &it, NULL);
+
+  total_execs++;
+
+  /* Any subsequent operations on trace_bits must not be moved by the
+     compiler below this point. Past this location, trace_bits[] behave
+     very normally and do not have to be treated as volatile. */
+
+  MEM_BARRIER();
+
+  tb4 = *(u32*)trace_bits;
+
+#ifdef __x86_64__
+  classify_counts((u64*)trace_bits);
+#else
+  classify_counts((u32*)trace_bits);
+#endif /* ^__x86_64__ */
+
+  prev_timed_out = child_timed_out;
+
+  /* Report outcome to caller. */
+
+  if (child_timed_out) return FAULT_TMOUT;
+
+  if (WIFSIGNALED(status) && !stop_soon) {
+    kill_signal = WTERMSIG(status);
+    return FAULT_CRASH;
+  }
+
+  /* A somewhat nasty hack for MSAN, which doesn't support abort_on_error and
+     must use a special exit code. */
+
+  if (uses_asan && WEXITSTATUS(status) == MSAN_ERROR) {
+    kill_signal = 0;
+    return FAULT_CRASH;
+  }
+
+  if ((dumb_mode == 1 || no_forkserver) && tb4 == EXEC_FAIL_SIG)
+    return FAULT_ERROR;
+
+  return FAULT_NONE;
+
+}
+
 /* Write modified data to file for testing. If out_file is set, the old file
    is unlinked and a new one is created. Otherwise, out_fd is rewound and
    truncated. */
 
 static void write_to_testcase(void* mem, u32 len) {
 
-  memset(mem_write_to_testcase, 0, SIZE_MEM_WRITE_TO_TESTCASE);
-  memcpy(mem_write_to_testcase, mem, (len < SIZE_MEM_WRITE_TO_TESTCASE)?len:SIZE_MEM_WRITE_TO_TESTCASE);
+  memset((char*) mem_write_to_testcase, 0, SIZE_MEM_WRITE_TO_TESTCASE);
+  memcpy((char*) mem_write_to_testcase, mem, (len < SIZE_MEM_WRITE_TO_TESTCASE)?len:SIZE_MEM_WRITE_TO_TESTCASE);
 
   remove(TEST_CASE_LOG_PATH);
   s32 my_file = open(TEST_CASE_LOG_PATH, O_WRONLY | O_CREAT | O_EXCL , 0600);
@@ -2424,8 +2615,8 @@ static void write_to_testcase(void* mem, u32 len) {
 
 static void write_with_gap(void* mem, u32 len, u32 skip_at, u32 skip_len) {
 
-  memset(mem_write_to_testcase, 0, SIZE_MEM_WRITE_TO_TESTCASE);
-  memcpy(mem_write_to_testcase, mem, (len < SIZE_MEM_WRITE_TO_TESTCASE)?len:SIZE_MEM_WRITE_TO_TESTCASE);
+  memset((char*) mem_write_to_testcase, 0, SIZE_MEM_WRITE_TO_TESTCASE);
+  memcpy((char*) mem_write_to_testcase, mem, (len < SIZE_MEM_WRITE_TO_TESTCASE)?len:SIZE_MEM_WRITE_TO_TESTCASE);
 
   remove(TEST_CASE_LOG_PATH);
   s32 my_file = open(TEST_CASE_LOG_PATH, O_WRONLY | O_CREAT | O_EXCL , 0600);
@@ -2511,7 +2702,7 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
 
     write_to_testcase(use_mem, q->len);
 
-    fault = run_target(argv, use_tmout);
+    fault = send_test_to_xtf(argv, use_tmout);
 
     /* stop_soon is set by the handler for Ctrl+C. When it's pressed,
        we want to bail out quickly. */
@@ -3141,7 +3332,7 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
 
         u8 new_fault;
         write_to_testcase(mem, len);
-        new_fault = run_target(argv, hang_tmout);
+        new_fault = send_test_to_xtf(argv, hang_tmout);
 
         if (stop_soon || new_fault != FAULT_TMOUT) return keeping;
 
@@ -4422,7 +4613,7 @@ static u8 trim_case(char** argv, struct queue_entry* q, u8* in_buf) {
 
       write_with_gap(in_buf, q->len, remove_pos, trim_avail);
 
-      fault = run_target(argv, exec_tmout);
+      fault = send_test_to_xtf(argv, exec_tmout);
       trim_execs++;
 
       if (stop_soon || fault == FAULT_ERROR) goto abort_trimming;
@@ -4515,7 +4706,7 @@ EXP_ST u8 common_fuzz_stuff(char** argv, u8* out_buf, u32 len) {
 
   write_to_testcase(out_buf, len);
 
-  fault = run_target(argv, exec_tmout);
+  fault = send_test_to_xtf(argv, exec_tmout);
 
   if (stop_soon) return 1;
 
@@ -6644,7 +6835,7 @@ static void sync_fuzzers(char** argv) {
 
         write_to_testcase(mem, st.st_size);
 
-        fault = run_target(argv, exec_tmout);
+        fault = send_test_to_xtf(argv, exec_tmout);
 
         if (stop_soon) return;
 
@@ -7950,8 +8141,6 @@ int main(int argc, char** argv) {
   detect_file_args(argv + optind + 1);
 
   if (!out_file) setup_stdio_file();
-
-  //check_binary(argv[optind]);
 
   start_time = get_cur_time();
 
