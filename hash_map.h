@@ -21,7 +21,7 @@ hash_map* _hash_map_create(int num_buckets) {
     hash_map* map = (hash_map*) malloc(sizeof(hash_map));
 
     if( map ) {
-      map->num_buckets = num_buckets; 
+      map->num_buckets = num_buckets;
       map->buckets = (hash_bucket**) malloc(sizeof(hash_bucket*) * num_buckets);
 
        if( !map->buckets ) {
@@ -29,28 +29,28 @@ hash_map* _hash_map_create(int num_buckets) {
          return NULL;
        }
 
-       for(int i = 0; i < num_buckets; ++i) 
+       for(int i = 0; i < num_buckets; ++i)
          map->buckets[i] = NULL;
     }
 
-    return map; 
+    return map;
 }
 
 void _hash_map_destroy(hash_map* map) {
-  //not implemented 
+  //not implemented
 }
 
 hash_bucket* _hash_map_lookup(hash_map* map, uint64_t key) {
     uint64_t hash = _hash_function(map, key);
 
     if(map->buckets[hash] == NULL) {
-      return NULL; 
+      return NULL;
     } else {
       hash_bucket* cur = map->buckets[hash];
-      
+
       while(cur->key != key && cur->next)
         cur = cur->next;
-    
+
       return cur;
     }
 }
@@ -59,7 +59,7 @@ bool _hash_map_insert(hash_map* map, uint64_t key, uint64_t val) {
     uint64_t hash = _hash_function(map, key);
 
     hash_bucket* bucket = (hash_bucket*) malloc(sizeof(hash_bucket));
-      
+
     if(!bucket)
       return false;
 
@@ -75,9 +75,8 @@ bool _hash_map_insert(hash_map* map, uint64_t key, uint64_t val) {
         cur = cur->next;
       }
 
-      cur->next = bucket; 
+      cur->next = bucket;
     }
 
     return true;
 }
-

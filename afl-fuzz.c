@@ -82,7 +82,7 @@
 /* Lots of globals, but mostly for the status UI and other things where it
    really makes no sense to haul them around as function parameters. */
 
-#define NUM_BUCKETS 1000 
+#define NUM_BUCKETS 1000
 #define SIZE_MEM_WRITE_TO_TESTCASE 80
 #define TEST_CASE_LOG_PATH "/home/felix/testcase"
 #define OVERALL_LOG_PATH "/home/felix/afl.log"
@@ -125,7 +125,7 @@ EXP_ST u8  skip_deterministic,        /* Skip deterministic stages?       */
            not_on_tty,                /* stdout is not a tty              */
            term_too_small,            /* terminal dimensions too small    */
            uses_asan,                 /* Target uses ASAN?                */
-           no_forkserver = 1,         /* Disable forkserver?              */
+           no_forkserver,             /* Disable forkserver?              */
            crash_mode,                /* Crash mode! Yeah!                */
            in_place_resume,           /* Attempt in-place resume?         */
            auto_changed,              /* Auto-generated tokens changed?   */
@@ -2283,12 +2283,11 @@ void process_program_counters(uint64_t* pc_buffer, long pc_num) {
 
   for(int i = 0; i < pc_num; ++i) {
     bucket = _hash_map_lookup(map, pc_buffer[i]);
+
     if( !bucket ) {
        cur_location = UR(MAP_SIZE);
-       if(!_hash_map_insert(map, pc_buffer[i], cur_location)) {
-         printf("Couldn't insert into hash map\n");
-         exit(1);
-       }
+       if(!_hash_map_insert(map, pc_buffer[i], cur_location))
+         FATAL("process_program_counters: Could not insert into hash map\n");
     } else {
       cur_location = bucket->val;
     }
@@ -2303,7 +2302,7 @@ void process_program_counters(uint64_t* pc_buffer, long pc_num) {
 /* Execute target application, monitoring for timeouts. Return status
    information. The called program will update trace_bits[]. */
 
-/* command to run AFL: sudo ./afl-fuzz -i /home/felix/testcase_dir -o /home/felix/findings_dir -r 35 / */
+/* command to run AFL: sudo ./afl-fuzz -i /home/felix/testcase_dir -o /home/felix/findings_dir -r DOM_ID /not/used/path; Also need to set AFL_NO_FORKSRV=1 env variable*/
 
 static u8 run_target(char** argv, u32 timeout) {
 
@@ -2315,15 +2314,12 @@ static u8 run_target(char** argv, u32 timeout) {
   arg4 = *(((long*) mem_write_to_testcase) + 4);
 
   int int_ret;
-  if( (int_ret = fprintf(log_file, "get_cur_time %ld %li %li %ld %ld %ld\n", get_cur_time(), hypercall_num, arg1, arg2, arg3, arg4)) < 0) {
-    printf("Couldn't write to file\n");
-    exit(1);
-  }
-  
+  if( (int_ret = fprintf(log_file, "get_cur_time %ld %li %li %ld %ld %ld\n", get_cur_time(), hypercall_num, arg1, arg2, arg3, arg4)) < 0)
+    FATAL("run_target: Couldn't write to file\n");
+
   fflush(log_file);
 
   memset(trace_bits, 0, MAP_SIZE);
-//  printf("argv[0]: %s argv[1]: %s\n", argv[0], argv[1]);
 
   size_t buf_size = 100;
   char buffer[buf_size];
@@ -2339,19 +2335,17 @@ static u8 run_target(char** argv, u32 timeout) {
 
   if(xch == NULL) {
     fclose(log_file);
-    printf("Couldn't open xen interface\n");
-    exit(1);
+    FATAL("run_target: Couldn't open xen interface\n");
   }
   
   ret = xc_trace_pc(xch, atoi(domain), 0, pc_buffer_size, pc_buffer);
 
   if(ret < 0) {
     fclose(log_file);
-    printf("Start edge_trace failed: %ld\n", ret);
     xc_interface_close(xch);
-    exit(1);
+    FATAL("run_target: Start edge_trace failed\n");
   }
-   
+
   (void) write(pipefd_to_xtf[1], mem_write_to_testcase, SIZE_MEM_WRITE_TO_TESTCASE);
 
   num = read(pipefd_from_xtf[0], buffer, buf_size);
@@ -2359,11 +2353,11 @@ static u8 run_target(char** argv, u32 timeout) {
 
   if( num <= 0 ) {
      fclose(log_file);
-     printf("Couldn't read from XTF\n");
      xc_interface_close(xch);
+     FATAL("run_target: Couldn't read from XTF\n");
      exit(1);
   }
-  
+
   long pc_num = xc_trace_pc(xch, atoi(domain), 1, pc_buffer_size, pc_buffer);
   xc_interface_close(xch);
 
@@ -2472,7 +2466,6 @@ static void show_stats(void);
 static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
                          u32 handicap, u8 from_queue) {
 
-  //printf("calibrating case\n");
   static u8 first_trace[MAP_SIZE];
 
   u8  fault = 0, new_bits = 0, var_detected = 0,
@@ -2523,7 +2516,6 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
     if (stop_soon || fault != crash_mode) goto abort_calibration;
 
     if (!dumb_mode && !stage_cur && !count_bytes(trace_bits)) {
-      //printf("Counted bytes, fault noinst\n");
       fault = FAULT_NOINST;
       goto abort_calibration;
     }
@@ -2588,7 +2580,6 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
   if (!dumb_mode && first_run && !fault && !new_bits) fault = FAULT_NOBITS;
 
 abort_calibration:
-//  printf("Aborted calibration");
 
   if (new_bits == 2 && !q->has_new_cov) {
     q->has_new_cov = 1;
@@ -4427,7 +4418,6 @@ static u8 trim_case(char** argv, struct queue_entry* q, u8* in_buf) {
       u32 cksum;
 
       write_with_gap(in_buf, q->len, remove_pos, trim_avail);
-      //TODO: I am not submitting the right test case here
 
       fault = run_target(argv, exec_tmout);
       trim_execs++;
@@ -4606,9 +4596,6 @@ static u32 choose_block_len(u32 limit) {
    go into config.h. */
 
 static u32 calculate_score(struct queue_entry* q) {
-
-  //TODO: I assume that this is a bug caused by sth I did
-  //  if(!total_cal_cycles) return 0;
 
   u32 avg_exec_us = total_cal_us / total_cal_cycles;
   u32 avg_bitmap_size = total_bitmap_size / total_bitmap_entries;
@@ -4950,8 +4937,6 @@ static u8 fuzz_one(char** argv) {
    *******************************************/
 
   if (queue_cur->cal_failed) {
-
-    printf("calibration failed earlier\n");
 
     u8 res = FAULT_TMOUT;
 
@@ -7621,7 +7606,11 @@ static void save_cmdline(u32 argc, char** argv) {
 }
 
 /**
-  * @param domid Point to domid of XTF
+  * @param domid_s Point to domid of XTF
+  *
+  * This function does initial setup needed for the fuzzing. It also
+  * sets up pipes such that stdout and stdin can be used to communicate
+  * with the XTF-server.
   *
   * TODO: error checking, always need sudo
   */
@@ -7629,8 +7618,7 @@ static void setup_pipe_and_fork(char *domid_s) {
   map = _hash_map_create(NUM_BUCKETS);
 
   if(!map) {
-    printf("Hash map could not be created");
-    exit(1);
+    FATAL("setup_pipe_and_fork: Hash map could not be created\n");
   }
 
   log_file = fopen(OVERALL_LOG_PATH, "w");
@@ -7640,14 +7628,12 @@ static void setup_pipe_and_fork(char *domid_s) {
 
   if( (ret = pipe(pipefd_to_xtf)) < 0)
     goto FAIL;
- 
+
   if( (ret = pipe(pipefd_from_xtf)) < 0)
     goto FAIL;
 
-  if((childpid = fork()) == -1) {
-    perror("fork");
-    exit(1);
-  }
+  if((childpid = fork()) == -1)
+    FATAL("setup_pipe_and_fork: fork failed");
 
   if (childpid == 0) { /* child */
 
@@ -7665,28 +7651,24 @@ static void setup_pipe_and_fork(char *domid_s) {
     if( (ret = dup(pipefd_from_xtf[1])) < 0 )
       goto FAIL;
 
-    //char path[] = "/usr/local/sbin/xl";
     /* actually need to use second console */
-    //if( execl(path, path, "console", "-i", domid_s,  NULL) < 0 )
-    //  perror("execl");
-
     char path[] = "/usr/local/lib/xen/bin/xenconsole";
     if( execl(path, path, domid_s, "--num", "0", "--type", "pv",
-           "--interactive", (void *)NULL) < 0 )
-      perror("execl");
+              "--interactive", (void *)NULL) < 0 )
+      FATAL("setup_pipe_and_fork: execl");
 
   } else { /* parent */
 
     /* close unnecessary pipe ends */
     close(pipefd_to_xtf[0]);
     close(pipefd_from_xtf[1]);
+
   }
 
   return;
 
   FAIL:
-    printf("Failed to setup pipes, domain: %s, ret = %d\n", domain, ret);
-    exit(1);
+    FATAL("setup_pipe_and_fork: Failed to setup pipes\n");
 }
 
 
